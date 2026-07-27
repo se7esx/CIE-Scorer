@@ -1,0 +1,37 @@
+name: cie-scorer
+channels:
+  - conda-forge
+  - defaults
+dependencies:
+  - pip=25.1
+  - python=3.12.11
+  - pyyaml
+  - readline
+  - requests
+  - setuptools
+  - wheel
+  - pip:
+    - accelerate==1.8.1
+    - datasets==3.6.0
+    - fire==0.7.0
+    - huggingface-hub==0.33.1
+    - hf-transfer==0.1.9
+    - hf-xet==1.1.5
+    - matplotlib==3.10.5
+    - multiprocess==0.70.16
+    - networkx==3.5
+    - numpy==1.26.4
+    - pandas==2.3.0
+    - pot==0.9.5
+    - safetensors==0.5.3
+    - scikit-learn==1.7.1
+    - scipy==1.16.1
+    - seaborn==0.13.2
+    - sentencepiece==0.2.0
+    - tokenizers==0.21.2
+    - torch==2.7.1
+    - torch-geometric==2.6.1
+    - tqdm==4.67.1
+    - transformer-lens==2.15.4
+    - transformers==4.52.4
+    - -e .

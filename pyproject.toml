@@ -1,0 +1,27 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "cie-scorer"
+version = "0.1.0"
+description = "Circuit-guided Internal-External discrepancy scorer for detecting unfaithful chain-of-thought reasoning."
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "accelerate>=1.8.1",
+    "numpy>=1.26.4",
+    "pot>=0.9.5",
+    "scikit-learn>=1.7.1",
+    "torch>=2.7.1",
+    "torch-geometric>=2.6.1",
+    "tqdm>=4.67.1",
+    "transformers>=4.52.4",
+]
+
+[project.scripts]
+cie-score-jsonl = "cie_scorer.score_jsonl:main"
+cie-score-faithcot = "cie_scorer.score_faithcot:main"
+
+[tool.setuptools.packages.find]
+include = ["cie_scorer*"]
