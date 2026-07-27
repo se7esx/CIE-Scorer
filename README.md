@@ -160,20 +160,7 @@ pyproject.toml
 README.md
 ```
 
-## Citation
 
-If you use this project, please cite:
-
-```bibtex
-@article{shen2026detecting,
-  title={Detecting Unfaithful Chain-of-Thought via Circuit-Guided Internal-External Discrepancy},
-  author={Shen, Xu and Tan, Zhen and Wang, Song and Hong, Pingjun and Miao, Rui and Wang, Xin and Chen, Tianlong},
-  journal={arXiv preprint arXiv:2605.25603},
-  year={2026}
-}
-```
-
-Paper: https://arxiv.org/pdf/2605.25603
 
 ## License
 
