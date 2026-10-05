@@ -15,7 +15,7 @@ from sklearn.metrics import f1_score, accuracy_score
 from torch_geometric.data import Data
 from torch_geometric.loader import DataLoader as PyGDataLoader
 from torch_geometric.nn import GINConv, global_mean_pool
-from transformers import AutoTokenizer, AutoModelForCausalLM
+from transformers import AutoTokenizer, AutoModel
 import ot
 
 
@@ -244,17 +244,18 @@ def stratified_trace_split(
 
 
 class FrozenSentenceEncoder:
-    def __init__(self, model_name: str, layer_idx: int = 15, device: str = "cuda"):
+    """Frozen BERT sentence encoder for the external reasoning view.
+
+    Each reasoning sentence is encoded independently with a frozen BERT model and
+    mean-pooled over its tokens. This keeps the external representation a pure
+    text view, independent of the target LLM's internal hidden states.
+    """
+
+    def __init__(self, model_name: str = "bert-base-uncased", device: str = "cuda", max_length: int = 256):
         self.device = device
-        self.layer_idx = layer_idx
+        self.max_length = max_length
         self.tokenizer = AutoTokenizer.from_pretrained(model_name)
-        if self.tokenizer.pad_token is None:
-            self.tokenizer.pad_token = self.tokenizer.eos_token
-        self.model = AutoModelForCausalLM.from_pretrained(
-            model_name,
-            torch_dtype=torch.bfloat16 if "cuda" in device else torch.float32,
-            device_map=None
-        ).to(device)
+        self.model = AutoModel.from_pretrained(model_name).to(device)
         self.model.eval()
 
     @torch.no_grad()
@@ -266,17 +267,12 @@ class FrozenSentenceEncoder:
                 batch_sent,
                 return_tensors="pt",
                 truncation=True,
-                max_length=2048,
+                max_length=self.max_length,
                 padding=True,
             )
             toks = {k: v.to(self.device) for k, v in toks.items()}
-            out = self.model(
-                **toks,
-                output_hidden_states=True,
-                use_cache=False,
-                return_dict=True,
-            )
-            hs = out.hidden_states[self.layer_idx]
+            out = self.model(**toks, return_dict=True)
+            hs = out.last_hidden_state
             mask = toks["attention_mask"].unsqueeze(-1)
             sent_emb = (hs * mask).sum(dim=1) / mask.sum(dim=1).clamp(min=1)
             all_embs.append(sent_emb.float().cpu())
@@ -594,8 +590,8 @@ def save_detector_checkpoint(
     model: JointFGWUnfaithfulnessDetector,
     threshold: float,
     *,
-    hf_model_name: str,
-    layer_idx: int,
+    bert_model_name: str,
+    max_length: int,
     ext_in_dim: int,
     int_in_dim: int,
     hidden_dim: int,
@@ -612,8 +608,8 @@ def save_detector_checkpoint(
         "format_version": 1,
         "state_dict": {k: v.detach().cpu() for k, v in model.state_dict().items()},
         "threshold": float(threshold),
-        "hf_model_name": hf_model_name,
-        "layer_idx": int(layer_idx),
+        "bert_model_name": bert_model_name,
+        "max_length": int(max_length),
         "model_config": {
             "ext_in_dim": int(ext_in_dim),
             "int_in_dim": int(int_in_dim),
@@ -643,8 +639,8 @@ def main():
         required=True,
         help="Directory containing index.json and processed/*.pt"
     )
-    parser.add_argument("--hf_model_name", type=str, default="meta-llama/Llama-3.1-8B-Instruct")
-    parser.add_argument("--layer_idx", type=int, default=15)
+    parser.add_argument("--bert_model_name", type=str, default="bert-base-uncased")
+    parser.add_argument("--max_length", type=int, default=256)
     parser.add_argument("--test_size", type=float, default=0.4)
     parser.add_argument("--val_size", type=float, default=0.3)
     parser.add_argument("--epochs", type=int, default=20)
@@ -689,8 +685,8 @@ def main():
 
     print("[3/6] Building frozen external sentence encoder and precomputing sentence embeddings...")
     sentence_encoder = FrozenSentenceEncoder(
-        model_name=args.hf_model_name,
-        layer_idx=args.layer_idx,
+        model_name=args.bert_model_name,
+        max_length=args.max_length,
         device=args.device,
     )
     precompute_external_embeddings(train_records, sentence_encoder, batch_size=args.ext_batch_size)
@@ -745,8 +741,8 @@ def main():
             args.checkpoint_out,
             model,
             best_threshold,
-            hf_model_name=args.hf_model_name,
-            layer_idx=args.layer_idx,
+            bert_model_name=args.bert_model_name,
+            max_length=args.max_length,
             ext_in_dim=ext_in_dim,
             int_in_dim=int_in_dim,
             hidden_dim=args.hidden_dim,
