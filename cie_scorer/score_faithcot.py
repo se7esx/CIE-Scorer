@@ -5,14 +5,22 @@ import argparse
 import gc
 import json
 import re
+import sys
 from pathlib import Path
 from typing import Any, Dict, List, Tuple
 
 import torch
+from torch_geometric.data import Data
+from torch_geometric.utils import dense_to_sparse
 from tqdm import tqdm
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
-from .circuit import (
+REPO_ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(REPO_ROOT / "features"))
+
+# Keep these imports explicit so this file also documents the CIE implementation
+# components it reuses.
+from entropy_circuit_v2 import (  # noqa: E402
     ALWAYS_INCLUDE_LAST,
     BATCH_SIZE,
     BETA,
@@ -30,72 +38,20 @@ from .circuit import (
     decode_selected_tokens,
     select_positions_entropy_causal,
 )
-from .detector import (
+from faithful_detector import (  # noqa: E402
     FrozenSentenceEncoder,
     JointFGWUnfaithfulnessDetector,
     TraceRecord,
 )
-from .graph_features import graph_to_data_compressed
-from circuit_tracer import ReplacementModel
+from graph_features_extraction import (  # noqa: E402
+    build_node_feature_matrix_compressed,
+    graph_to_data_compressed,
+)
+from circuit_tracer import ReplacementModel  # noqa: E402
 
 
 DEFAULT_MODEL = "meta-llama/Llama-3.1-8B-Instruct"
 DEFAULT_TRANSCODERS = "facebook/crv-8b-instruct-transcoders"
-
-
-def load_replacement_model(
-    model_name, transcoder_ref, *, dtype=torch.bfloat16, device=None,
-    official_name="Qwen/Qwen2.5-7B-Instruct",
-):
-    """Build a ReplacementModel, supporting LOCAL offline paths for BOTH the
-    base model and the transcoders.
-
-    - model_name may be an official HF name OR a local weights directory. For a
-      local dir we load the HF weights/tokenizer ourselves and use
-      `official_name` (a TransformerLens-supported name) for the architecture
-      config, so nothing is fetched from the hub.
-    - transcoder_ref may be a hub repo id OR a local export dir (config.yaml +
-      layer_*.safetensors produced by export_to_crv.py).
-    """
-    import yaml
-    from pathlib import Path
-    from circuit_tracer.utils.hf_utils import load_transcoders
-
-    model_kwargs = {}
-    tl_name = model_name
-    if Path(model_name).is_dir():
-        from transformers import AutoModelForCausalLM, AutoTokenizer
-
-        tl_name = official_name
-        model_kwargs["hf_model"] = AutoModelForCausalLM.from_pretrained(
-            model_name, torch_dtype=dtype
-        )
-        model_kwargs["tokenizer"] = AutoTokenizer.from_pretrained(model_name)
-
-    ref_path = Path(transcoder_ref)
-    config_file = ref_path / "config.yaml"
-    if ref_path.is_dir() and config_file.is_file():
-        with config_file.open("r", encoding="utf-8") as handle:
-            config = yaml.safe_load(handle)
-        config["transcoders"] = [
-            str((ref_path / rel).resolve()) for rel in config["transcoders"]
-        ]
-        config.setdefault("scan", str(ref_path.resolve()))
-        config.setdefault("repo_id", "")
-        transcoders = load_transcoders(
-            config, device=device, dtype=dtype, lazy_encoder=True, lazy_decoder=True
-        )
-    else:
-        from circuit_tracer.utils.hf_utils import load_transcoder_from_hub
-
-        transcoders, _ = load_transcoder_from_hub(
-            transcoder_ref, device=device, dtype=dtype,
-            lazy_encoder=True, lazy_decoder=True,
-        )
-
-    return ReplacementModel.from_pretrained_and_transcoders(
-        tl_name, transcoders, device=device, dtype=dtype, **model_kwargs
-    )
 
 
 def parse_args() -> argparse.Namespace:
@@ -113,6 +69,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--transcoder_name", default=DEFAULT_TRANSCODERS)
     parser.add_argument("--prompt_field", default="prompt")
     parser.add_argument("--max_new_tokens", type=int, default=2048)
+    parser.add_argument(
+        "--max_circuit_tokens",
+        type=int,
+        default=384,
+        help=(
+            "Maximum tokens used to construct one sentence-level circuit. "
+            "Longer text keeps both its beginning and end to bound attribution VRAM."
+        ),
+    )
     parser.add_argument("--device", default="cuda")
     parser.add_argument(
         "--raw_prompt",
@@ -123,6 +88,14 @@ def parse_args() -> argparse.Namespace:
         "--overwrite",
         action="store_true",
         help="Regenerate responses, circuits, and the final output.",
+    )
+    parser.add_argument(
+        "--no_save_circuits",
+        action="store_true",
+        help=(
+            "Keep compressed circuit features in RAM for this job instead of "
+            "writing raw step circuit files to work_dir."
+        ),
     )
     return parser.parse_args()
 
@@ -273,6 +246,149 @@ def load_response(path: Path) -> Tuple[Dict[str, Any], List[str]]:
     return response, [sample[key].strip() for key in step_keys]
 
 
+def graph_to_data_in_memory(graph: Any, metadata: Dict[str, Any]) -> Data:
+    """Convert a circuit graph to the detector's sparse PyG format without I/O."""
+    graph.to("cpu")
+    adjacency = graph.adjacency_matrix.float().cpu()
+    adjacency = adjacency + adjacency.T
+    edge_index, edge_weight = dense_to_sparse(adjacency)
+    edge_attr = torch.stack(
+        [edge_weight, edge_weight.abs(), torch.sign(edge_weight)], dim=1
+    ).float()
+    node_features = build_node_feature_matrix_compressed(graph, metadata)
+    return Data(
+        x=node_features,
+        edge_index=edge_index.long(),
+        edge_attr=edge_attr,
+    )
+
+
+def bounded_circuit_input(
+    text: str, model: ReplacementModel, max_tokens: int
+) -> Tuple[torch.Tensor, int, bool]:
+    """Tokenize text and bound attribution length while preserving both ends."""
+    input_ids = model.ensure_tokenized(text).flatten()
+    original_tokens = int(input_ids.numel())
+    if max_tokens <= 0 or original_tokens <= max_tokens:
+        return input_ids, original_tokens, False
+
+    head_tokens = max_tokens // 2
+    tail_tokens = max_tokens - head_tokens
+    input_ids = torch.cat(
+        [input_ids[:head_tokens], input_ids[-tail_tokens:]], dim=0
+    )
+    return input_ids, original_tokens, True
+
+
+def is_cuda_oom(error: BaseException) -> bool:
+    return isinstance(error, torch.OutOfMemoryError) or (
+        "cuda out of memory" in str(error).lower()
+    )
+
+
+def build_one_trace_circuits(
+    row: Dict[str, Any],
+    response_path: Path,
+    steps: List[str],
+    circuits_dir: Path,
+    model: ReplacementModel,
+    *,
+    prompt_field: str,
+    overwrite: bool,
+    no_save_circuits: bool,
+    max_circuit_tokens: int,
+) -> List[Any]:
+    """Build one trace so an OOM fully unwinds before the next trace starts."""
+    row_id = row["_cie_row_id"]
+    trace_dir = circuits_dir / f"response_{row_id}"
+    meta_dir = trace_dir / "selection_meta"
+    if not no_save_circuits:
+        trace_dir.mkdir(parents=True, exist_ok=True)
+        meta_dir.mkdir(parents=True, exist_ok=True)
+
+    trace_graphs: List[Any] = []
+    items = [row[prompt_field]] + steps
+    for step_num, sentence in enumerate(items):
+        graph_path = trace_dir / f"step_{step_num}.pt"
+        meta_path = meta_dir / f"step_{step_num}_selection.json"
+        if (
+            not no_save_circuits
+            and graph_path.exists()
+            and meta_path.exists()
+            and not overwrite
+        ):
+            continue
+
+        circuit_input, original_tokens, was_truncated = bounded_circuit_input(
+            sentence, model, max_circuit_tokens
+        )
+        print(
+            f"[circuit] trace={row_id} step={step_num} "
+            f"tokens={original_tokens} used={int(circuit_input.numel())}"
+            + (" (head+tail truncated)" if was_truncated else ""),
+            flush=True,
+        )
+
+        selected, input_ids, entropies, causal_scores, final_scores = (
+            select_positions_entropy_causal(
+                prompt=circuit_input,
+                model=model,
+                top_k=TOKEN_BUDGET,
+                temperature=ENTROPY_TEMPERATURE,
+                candidate_budget=CANDIDATE_BUDGET,
+                sentence_lambda=SENTENCE_LAMBDA,
+                beta=BETA,
+                diversity_penalty=DIVERSITY_PENALTY,
+                always_include_last=ALWAYS_INCLUDE_LAST,
+                skip_first_token=True,
+            )
+        )
+        target_pos = max(selected)
+        graph = attribute_compressed(
+            prompt=circuit_input,
+            model=model,
+            max_n_logits=MAX_N_LOGITS,
+            desired_logit_prob=DESIRED_LOGIT_PROB,
+            batch_size=BATCH_SIZE,
+            max_feature_nodes=MAX_FEATURE_NODES,
+            max_features_per_position=MAX_FEATURES_PER_POSITION,
+            offload="cpu",
+            verbose=False,
+            update_interval=UPDATE_INTERVAL,
+            selected_positions=selected,
+            target_pos=target_pos,
+        )
+        metadata = {
+            "source_trace_file": str(response_path.resolve()),
+            "step_num": step_num,
+            "step_text": sentence if step_num else "__base_prompt__",
+            "prompt": sentence,
+            "original_token_count": original_tokens,
+            "circuit_token_count": int(circuit_input.numel()),
+            "circuit_input_truncated": was_truncated,
+            "selected_positions": selected,
+            "selected_tokens": decode_selected_tokens(input_ids, selected, model),
+            "target_pos": target_pos,
+            "entropies": [float(value) for value in entropies.tolist()],
+            "causal_scores": {str(k): float(v) for k, v in causal_scores.items()},
+            "final_scores": {str(k): float(v) for k, v in final_scores.items()},
+        }
+        if no_save_circuits:
+            trace_graphs.append(graph_to_data_in_memory(graph, metadata))
+        else:
+            graph.to_pt(graph_path)
+            meta_path.write_text(
+                json.dumps(metadata, ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
+        del graph, input_ids, entropies, circuit_input
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+    return trace_graphs
+
+
 def build_circuits(
     rows: List[Dict[str, Any]],
     responses_dir: Path,
@@ -282,12 +398,21 @@ def build_circuits(
     transcoder_name: str,
     prompt_field: str,
     overwrite: bool,
-) -> None:
+    no_save_circuits: bool,
+    max_circuit_tokens: int,
+) -> Tuple[Dict[str, List[Any]] | None, Dict[str, str]]:
+    in_memory_graphs: Dict[str, List[Any]] | None = (
+        {} if no_save_circuits else None
+    )
     missing: List[Tuple[Dict[str, Any], Path, List[str]]] = []
     for row in rows:
         row_id = row["_cie_row_id"]
         response_path = responses_dir / f"response_{row_id}.json"
         _, steps = load_response(response_path)
+        if no_save_circuits:
+            missing.append((row, response_path, steps))
+            continue
+
         trace_dir = circuits_dir / f"response_{row_id}"
         expected = []
         for i in range(len(steps) + 1):
@@ -301,81 +426,56 @@ def build_circuits(
             missing.append((row, response_path, steps))
     if not missing:
         print("[circuits] All cached sentence circuits are present.")
-        return
+        return in_memory_graphs, {}
 
     print(f"[circuits] Loading replacement model for {len(missing)} traces.")
-    model = load_replacement_model(
-        model_name, transcoder_name, dtype=torch.bfloat16
+    model = ReplacementModel.from_pretrained(
+        model_name,
+        transcoder_name,
+        dtype=torch.bfloat16,
+        lazy_encoder=False,
+        lazy_decoder=True,
     )
 
+    oom_failures: Dict[str, str] = {}
     for row, response_path, steps in tqdm(missing, desc="Tracing responses"):
         row_id = row["_cie_row_id"]
-        trace_dir = circuits_dir / f"response_{row_id}"
-        meta_dir = trace_dir / "selection_meta"
-        trace_dir.mkdir(parents=True, exist_ok=True)
-        meta_dir.mkdir(parents=True, exist_ok=True)
-        items = [row[prompt_field]] + steps
-
-        for step_num, sentence in enumerate(items):
-            graph_path = trace_dir / f"step_{step_num}.pt"
-            meta_path = meta_dir / f"step_{step_num}_selection.json"
-            if graph_path.exists() and meta_path.exists() and not overwrite:
-                continue
-
-            selected, input_ids, entropies, causal_scores, final_scores = (
-                select_positions_entropy_causal(
-                    prompt=sentence,
-                    model=model,
-                    top_k=TOKEN_BUDGET,
-                    temperature=ENTROPY_TEMPERATURE,
-                    candidate_budget=CANDIDATE_BUDGET,
-                    sentence_lambda=SENTENCE_LAMBDA,
-                    beta=BETA,
-                    diversity_penalty=DIVERSITY_PENALTY,
-                    always_include_last=ALWAYS_INCLUDE_LAST,
-                    skip_first_token=True,
-                )
+        try:
+            trace_graphs = build_one_trace_circuits(
+                row,
+                response_path,
+                steps,
+                circuits_dir,
+                model,
+                prompt_field=prompt_field,
+                overwrite=overwrite,
+                no_save_circuits=no_save_circuits,
+                max_circuit_tokens=max_circuit_tokens,
             )
-            target_pos = max(selected)
-            graph = attribute_compressed(
-                prompt=sentence,
-                model=model,
-                max_n_logits=MAX_N_LOGITS,
-                desired_logit_prob=DESIRED_LOGIT_PROB,
-                batch_size=BATCH_SIZE,
-                max_feature_nodes=MAX_FEATURE_NODES,
-                max_features_per_position=MAX_FEATURES_PER_POSITION,
-                offload="cpu",
-                verbose=False,
-                update_interval=UPDATE_INTERVAL,
-                selected_positions=selected,
-                target_pos=target_pos,
+            if in_memory_graphs is not None:
+                in_memory_graphs[row_id] = trace_graphs
+        except Exception as error:
+            if not is_cuda_oom(error):
+                raise
+            message = str(error).splitlines()[0][:500]
+            oom_failures[row_id] = message
+            if in_memory_graphs is not None:
+                in_memory_graphs.pop(row_id, None)
+            print(
+                f"[WARN] trace={row_id} skipped after CUDA OOM; "
+                "unfaithful_score will be 0.0",
+                flush=True,
             )
-            graph.to_pt(graph_path)
-            metadata = {
-                "source_trace_file": response_path.name,
-                "step_num": step_num,
-                "step_text": sentence if step_num else "__base_prompt__",
-                "prompt": sentence,
-                "selected_positions": selected,
-                "selected_tokens": decode_selected_tokens(input_ids, selected, model),
-                "target_pos": target_pos,
-                "entropies": [float(value) for value in entropies.tolist()],
-                "causal_scores": {str(k): float(v) for k, v in causal_scores.items()},
-                "final_scores": {str(k): float(v) for k, v in final_scores.items()},
-            }
-            meta_path.write_text(
-                json.dumps(metadata, ensure_ascii=False, indent=2), encoding="utf-8"
-            )
-            del graph, input_ids, entropies
             gc.collect()
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
+            continue
 
     del model
     gc.collect()
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
+    return in_memory_graphs, oom_failures
 
 
 def load_internal_graphs(
@@ -402,6 +502,8 @@ def score_all(
     *,
     device: str,
     prompt_field: str,
+    in_memory_graphs: Dict[str, List[Any]] | None,
+    oom_failures: Dict[str, str],
 ) -> None:
     checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
     if checkpoint.get("format_version") != 1:
@@ -425,19 +527,59 @@ def score_all(
             row_id = row["_cie_row_id"]
             response_path = responses_dir / f"response_{row_id}.json"
             response, steps = load_response(response_path)
+            if row_id in oom_failures:
+                result = {
+                    key: value for key, value in row.items() if key != "_cie_row_id"
+                }
+                result["response"] = response["sample_0"]["full_response"]
+                result["unfaithful_score"] = 0.0
+                result["raw_fgw_distance"] = None
+                result["unfaithful_threshold"] = float(checkpoint["threshold"])
+                result["score_status"] = "cuda_oom_default_zero"
+                result["score_error"] = oom_failures[row_id]
+                stream.write(json.dumps(result, ensure_ascii=False) + "\n")
+                stream.flush()
+                continue
             sentences = [row[prompt_field]] + steps
-            internal_graphs = load_internal_graphs(
-                circuits_dir / f"response_{row_id}", len(steps)
-            )
+            if in_memory_graphs is not None:
+                internal_graphs = in_memory_graphs.pop(row_id)
+            else:
+                internal_graphs = load_internal_graphs(
+                    circuits_dir / f"response_{row_id}", len(steps)
+                )
             record = TraceRecord(
                 trace_id=row_id,
                 sentences=sentences,
                 label=0,
                 internal_graphs=internal_graphs,
             )
-            record.ext_embs = encoder.encode_sentences(sentences, batch_size=8)
-            with torch.no_grad():
-                score, raw_distance = detector(record, device=device)
+            try:
+                record.ext_embs = encoder.encode_sentences(sentences, batch_size=8)
+                with torch.no_grad():
+                    score, raw_distance = detector(record, device=device)
+            except Exception as error:
+                if not is_cuda_oom(error):
+                    raise
+                result = {
+                    key: value for key, value in row.items() if key != "_cie_row_id"
+                }
+                result["response"] = response["sample_0"]["full_response"]
+                result["unfaithful_score"] = 0.0
+                result["raw_fgw_distance"] = None
+                result["unfaithful_threshold"] = float(checkpoint["threshold"])
+                result["score_status"] = "cuda_oom_default_zero"
+                result["score_error"] = str(error).splitlines()[0][:500]
+                stream.write(json.dumps(result, ensure_ascii=False) + "\n")
+                stream.flush()
+                print(
+                    f"[WARN] trace={row_id} scoring CUDA OOM; wrote score 0.0",
+                    flush=True,
+                )
+                del record, internal_graphs
+                gc.collect()
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+                continue
 
             result = {key: value for key, value in row.items() if key != "_cie_row_id"}
             result["response"] = response["sample_0"]["full_response"]
@@ -465,7 +607,8 @@ def main() -> None:
     responses_dir = work_dir / "responses"
     circuits_dir = work_dir / "circuits"
     responses_dir.mkdir(parents=True, exist_ok=True)
-    circuits_dir.mkdir(parents=True, exist_ok=True)
+    if not args.no_save_circuits:
+        circuits_dir.mkdir(parents=True, exist_ok=True)
     rows = read_jsonl(input_path)
     print(f"Loaded {len(rows)} input records from {input_path}")
 
@@ -479,7 +622,7 @@ def main() -> None:
         raw_prompt=args.raw_prompt,
         overwrite=args.overwrite,
     )
-    build_circuits(
+    in_memory_graphs, oom_failures = build_circuits(
         rows,
         responses_dir,
         circuits_dir,
@@ -487,6 +630,8 @@ def main() -> None:
         transcoder_name=args.transcoder_name,
         prompt_field=args.prompt_field,
         overwrite=args.overwrite,
+        no_save_circuits=args.no_save_circuits,
+        max_circuit_tokens=args.max_circuit_tokens,
     )
     score_all(
         rows,
@@ -496,6 +641,8 @@ def main() -> None:
         output_path,
         device=args.device,
         prompt_field=args.prompt_field,
+        in_memory_graphs=in_memory_graphs,
+        oom_failures=oom_failures,
     )
 
 
