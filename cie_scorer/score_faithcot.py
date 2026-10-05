@@ -1,757 +1,502 @@
-import json
-import random
+#!/usr/bin/env python3
+"""Generate CoTs and compute one CIE-SCORER unfaithfulness score per JSONL row."""
+
 import argparse
+import gc
+import json
 import re
-from dataclasses import dataclass
 from pathlib import Path
-from typing import List, Dict, Any, Optional, Tuple
+from typing import Any, Dict, List, Tuple
 
-import numpy as np
 import torch
-import torch.nn as nn
-import torch.nn.functional as F
-from sklearn.model_selection import train_test_split
-from sklearn.metrics import f1_score, accuracy_score
-from torch_geometric.data import Data
-from torch_geometric.loader import DataLoader as PyGDataLoader
-from torch_geometric.nn import GINConv, global_mean_pool
-from transformers import AutoTokenizer, AutoModel
-import ot
+from tqdm import tqdm
+from transformers import AutoModelForCausalLM, AutoTokenizer
+
+from .circuit import (
+    ALWAYS_INCLUDE_LAST,
+    BATCH_SIZE,
+    BETA,
+    CANDIDATE_BUDGET,
+    DESIRED_LOGIT_PROB,
+    DIVERSITY_PENALTY,
+    ENTROPY_TEMPERATURE,
+    MAX_FEATURE_NODES,
+    MAX_FEATURES_PER_POSITION,
+    MAX_N_LOGITS,
+    SENTENCE_LAMBDA,
+    TOKEN_BUDGET,
+    UPDATE_INTERVAL,
+    attribute_compressed,
+    decode_selected_tokens,
+    select_positions_entropy_causal,
+)
+from .detector import (
+    FrozenSentenceEncoder,
+    JointFGWUnfaithfulnessDetector,
+    TraceRecord,
+)
+from .graph_features import graph_to_data_compressed
+from circuit_tracer import ReplacementModel
 
 
-def set_seed(seed: int = 42):
-    random.seed(seed)
-    np.random.seed(seed)
-    torch.manual_seed(seed)
-    torch.cuda.manual_seed_all(seed)
+DEFAULT_MODEL = "meta-llama/Llama-3.1-8B-Instruct"
+DEFAULT_TRANSCODERS = "facebook/crv-8b-instruct-transcoders"
 
 
-@dataclass
-class TraceRecord:
-    trace_id: str
-    sentences: List[str]
-    label: int                    # 1 = unfaithful, 0 = faithful
-    internal_graphs: List[Data]
-    ext_embs: Optional[np.ndarray] = None
+def load_replacement_model(
+    model_name, transcoder_ref, *, dtype=torch.bfloat16, device=None,
+    official_name="Qwen/Qwen2.5-7B-Instruct",
+):
+    """Build a ReplacementModel, supporting LOCAL offline paths for BOTH the
+    base model and the transcoders.
 
+    - model_name may be an official HF name OR a local weights directory. For a
+      local dir we load the HF weights/tokenizer ourselves and use
+      `official_name` (a TransformerLens-supported name) for the architecture
+      config, so nothing is fetched from the hub.
+    - transcoder_ref may be a hub repo id OR a local export dir (config.yaml +
+      layer_*.safetensors produced by export_to_crv.py).
+    """
+    import yaml
+    from pathlib import Path
+    from circuit_tracer.utils.hf_utils import load_transcoders
 
-def build_query_sentence(js: dict) -> str:
-    parts = []
-    if js.get("cot_prompt"):
-        parts.append(js["cot_prompt"].strip())
-    if js.get("question"):
-        parts.append(js["question"].strip())
-    if js.get("options"):
-        opts = js["options"]
-        if isinstance(opts, list) and len(opts) > 0:
-            option_text = "\n".join([f"({chr(65+i)}) {opt}" for i, opt in enumerate(opts)])
-            parts.append(option_text)
-    return "\n".join(parts).strip()
+    model_kwargs = {}
+    tl_name = model_name
+    if Path(model_name).is_dir():
+        from transformers import AutoModelForCausalLM, AutoTokenizer
 
-
-def extract_reasoning_steps(js: dict, sample_key: str = "sample_0") -> List[str]:
-    if sample_key not in js:
-        return []
-    sample = js[sample_key]
-    step_keys = sorted(
-        [k for k in sample.keys() if re.fullmatch(r"step_\d+", k)],
-        key=lambda x: int(x.split("_")[1])
-    )
-    return [sample[k].strip() for k in step_keys]
-
-
-def load_json_traces(json_source: str) -> Dict[str, Dict[str, Any]]:
-    json_source = Path(json_source)
-
-    if json_source.is_file():
-        json_files = [json_source]
-    elif json_source.is_dir():
-        json_files = sorted(json_source.glob("*.json"))
-    else:
-        raise FileNotFoundError(f"Path not found: {json_source}")
-
-    if len(json_files) == 0:
-        raise FileNotFoundError(f"No JSON files found under {json_source}")
-
-    traces: Dict[str, Dict[str, Any]] = {}
-
-    for fp in json_files:
-        with open(fp, "r", encoding="utf-8") as f:
-            js = json.load(f)
-
-        trace_id = fp.stem
-        query_sentence = build_query_sentence(js)
-
-        sample_keys = sorted(
-            [k for k in js.keys() if re.fullmatch(r"sample_\d+", k)],
-            key=lambda x: int(x.split("_")[1])
+        tl_name = official_name
+        model_kwargs["hf_model"] = AutoModelForCausalLM.from_pretrained(
+            model_name, torch_dtype=dtype
         )
-        if len(sample_keys) == 0:
-            print(f"[WARN] No sample_* key found in {fp}, skipped.")
-            continue
+        model_kwargs["tokenizer"] = AutoTokenizer.from_pretrained(model_name)
 
-        if len(sample_keys) > 1:
-            print(f"[WARN] Multiple sample_* keys found in {fp}; using {sample_keys[0]} only.")
+    ref_path = Path(transcoder_ref)
+    config_file = ref_path / "config.yaml"
+    if ref_path.is_dir() and config_file.is_file():
+        with config_file.open("r", encoding="utf-8") as handle:
+            config = yaml.safe_load(handle)
+        config["transcoders"] = [
+            str((ref_path / rel).resolve()) for rel in config["transcoders"]
+        ]
+        config.setdefault("scan", str(ref_path.resolve()))
+        config.setdefault("repo_id", "")
+        transcoders = load_transcoders(
+            config, device=device, dtype=dtype, lazy_encoder=True, lazy_decoder=True
+        )
+    else:
+        from circuit_tracer.utils.hf_utils import load_transcoder_from_hub
 
-        sample_key = sample_keys[0]
-        reasoning_steps = extract_reasoning_steps(js, sample_key=sample_key)
-        label = int(js.get("unfaithfulness", 0))
+        transcoders, _ = load_transcoder_from_hub(
+            transcoder_ref, device=device, dtype=dtype,
+            lazy_encoder=True, lazy_decoder=True,
+        )
 
-        if trace_id in traces:
-            raise ValueError(f"Duplicate trace_id detected: {trace_id}")
-
-        traces[trace_id] = {
-            "trace_id": trace_id,
-            "query_sentence": query_sentence,
-            "reasoning_steps": reasoning_steps,
-            "label": label,
-        }
-
-    print(f"[INFO] loaded {len(traces)} external traces from {json_source}")
-    return traces
-
-
-def load_internal_pyg_groups(internal_pyg_dir: str) -> Dict[str, List[Tuple[int, Data]]]:
-    internal_pyg_dir = Path(internal_pyg_dir)
-    processed_dir = internal_pyg_dir / "processed"
-    index_path = internal_pyg_dir / "index.json"
-
-    if not processed_dir.exists():
-        raise FileNotFoundError(f"Processed directory not found: {processed_dir}")
-    if not index_path.exists():
-        raise FileNotFoundError(f"index.json not found: {index_path}")
-
-    with open(index_path, "r", encoding="utf-8") as f:
-        index_data = json.load(f)
-
-    if not isinstance(index_data, list):
-        raise ValueError("Expected index.json to be a list of records.")
-
-    grouped: Dict[str, List[Tuple[int, Data]]] = {}
-    missing_files = 0
-
-    for item in index_data:
-        file_name = item["file_name"]
-        trace_id = str(item["response_name"])
-        step_num = int(item["step_num"])
-
-        fp = processed_dir / file_name
-        if not fp.exists():
-            print(f"[WARN] graph file not found: {fp}, skipped.")
-            missing_files += 1
-            continue
-
-        obj = torch.load(fp, weights_only=False)
-
-        if isinstance(obj, Data):
-            d = obj
-        elif isinstance(obj, dict) and "data" in obj and isinstance(obj["data"], Data):
-            d = obj["data"]
-        else:
-            raise ValueError(f"Unsupported graph object type in {fp}: {type(obj)}")
-
-        grouped.setdefault(trace_id, []).append((step_num, d))
-
-    for trace_id in grouped:
-        grouped[trace_id] = sorted(grouped[trace_id], key=lambda x: x[0])
-
-    print(f"[INFO] grouped {sum(len(v) for v in grouped.values())} graphs into {len(grouped)} traces")
-    if missing_files > 0:
-        print(f"[INFO] missing graph files skipped: {missing_files}")
-    return grouped
+    return ReplacementModel.from_pretrained_and_transcoders(
+        tl_name, transcoders, device=device, dtype=dtype, **model_kwargs
+    )
 
 
-def build_aligned_records(json_source: str, internal_pyg_dir: str) -> List[TraceRecord]:
-    external_traces = load_json_traces(json_source=json_source)
-    internal_groups = load_internal_pyg_groups(internal_pyg_dir=internal_pyg_dir)
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description=(
+            "Generate a response for each input prompt and emit its learned "
+            "CIE-SCORER unfaithfulness score."
+        )
+    )
+    parser.add_argument("--input_jsonl", required=True)
+    parser.add_argument("--output_jsonl", required=True)
+    parser.add_argument("--checkpoint", required=True)
+    parser.add_argument("--work_dir", required=True)
+    parser.add_argument("--model_name", default=DEFAULT_MODEL)
+    parser.add_argument("--transcoder_name", default=DEFAULT_TRANSCODERS)
+    parser.add_argument("--prompt_field", default="prompt")
+    parser.add_argument("--max_new_tokens", type=int, default=2048)
+    parser.add_argument("--device", default="cuda")
+    parser.add_argument(
+        "--raw_prompt",
+        action="store_true",
+        help="Do not wrap prompts with the tokenizer's instruct chat template.",
+    )
+    parser.add_argument(
+        "--overwrite",
+        action="store_true",
+        help="Regenerate responses, circuits, and the final output.",
+    )
+    return parser.parse_args()
 
-    records: List[TraceRecord] = []
-    skipped = 0
 
-    for trace_id, ext_meta in external_traces.items():
-        if trace_id not in internal_groups:
-            print(f"[WARN] trace {trace_id} not found in internal graphs, skipped.")
-            skipped += 1
-            continue
+def read_jsonl(path: Path) -> List[Dict[str, Any]]:
+    rows: List[Dict[str, Any]] = []
+    seen_ids = set()
+    with path.open("r", encoding="utf-8") as stream:
+        for line_no, line in enumerate(stream, 1):
+            if not line.strip():
+                continue
+            try:
+                row = json.loads(line)
+            except json.JSONDecodeError as exc:
+                raise ValueError(f"Invalid JSON on line {line_no}: {exc}") from exc
+            row_id = str(row.get("idx", len(rows)))
+            if row_id in seen_ids:
+                raise ValueError(f"Duplicate idx {row_id!r} on line {line_no}")
+            seen_ids.add(row_id)
+            row["_cie_row_id"] = row_id
+            rows.append(row)
+    if not rows:
+        raise ValueError(f"No records found in {path}")
+    return rows
 
-        internal_pairs = sorted(internal_groups[trace_id], key=lambda x: x[0])
-        step_nums = [k for k, _ in internal_pairs]
-        internal_graphs = [g for _, g in internal_pairs]
 
-        if len(step_nums) == 0:
-            print(f"[WARN] trace {trace_id} has no internal graphs, skipped.")
-            skipped += 1
-            continue
+def render_generation_prompt(
+    tokenizer: AutoTokenizer, prompt: str, raw_prompt: bool
+) -> str:
+    if raw_prompt or not getattr(tokenizer, "chat_template", None):
+        return prompt
+    return tokenizer.apply_chat_template(
+        [{"role": "user", "content": prompt}],
+        tokenize=False,
+        add_generation_prompt=True,
+    )
 
-        query_sentence = ext_meta["query_sentence"]
-        reasoning_steps = ext_meta["reasoning_steps"]
 
-        if min(step_nums) == 0:
-            candidate_sentences = [query_sentence] + reasoning_steps
-        else:
-            candidate_sentences = reasoning_steps
+def split_reasoning_steps(completion: str) -> Tuple[List[str], str]:
+    """Extract Step N blocks, with a conservative fallback for free-form CoTs."""
+    text = completion.strip()
+    final_match = re.search(r"(?im)^\s*final\s+answer\s*:", text)
+    reasoning = text[: final_match.start()].strip() if final_match else text
+    final_answer = text[final_match.start() :].strip() if final_match else ""
 
-        if len(candidate_sentences) < len(internal_graphs):
-            print(
-                f"[WARN] trace {trace_id} length mismatch: "
-                f"{len(candidate_sentences)} external sentences vs {len(internal_graphs)} internal graphs. Skipped."
+    matches = list(re.finditer(r"(?im)^\s*(?:#+\s*)?step\s+(\d+)\s*:", reasoning))
+    steps: List[str] = []
+    for i, match in enumerate(matches):
+        end = matches[i + 1].start() if i + 1 < len(matches) else len(reasoning)
+        step = reasoning[match.start() : end].strip()
+        if step:
+            steps.append(step)
+
+    if not steps:
+        steps = [part.strip() for part in re.split(r"\n\s*\n+", reasoning) if part.strip()]
+    if len(steps) == 1:
+        sentences = [
+            part.strip()
+            for part in re.split(r"(?<=[.!?])\s+(?=[A-Z0-9])", reasoning)
+            if part.strip()
+        ]
+        if len(sentences) > 1:
+            steps = [f"Step {i}: {sentence}" for i, sentence in enumerate(sentences, 1)]
+    if not steps and final_answer:
+        steps = [final_answer]
+    if not steps:
+        raise ValueError("The generated completion contains no usable reasoning text")
+    return steps, final_answer
+
+
+@torch.inference_mode()
+def generate_responses(
+    rows: List[Dict[str, Any]],
+    responses_dir: Path,
+    *,
+    model_name: str,
+    prompt_field: str,
+    max_new_tokens: int,
+    device: str,
+    raw_prompt: bool,
+    overwrite: bool,
+) -> None:
+    pending = [
+        row
+        for row in rows
+        if overwrite or not (responses_dir / f"response_{row['_cie_row_id']}.json").exists()
+    ]
+    if not pending:
+        print("[generation] All cached responses are present.")
+        return
+
+    print(f"[generation] Loading {model_name} for {len(pending)} prompts.")
+    tokenizer = AutoTokenizer.from_pretrained(model_name)
+    if tokenizer.pad_token_id is None:
+        tokenizer.pad_token = tokenizer.eos_token
+    model = AutoModelForCausalLM.from_pretrained(
+        model_name,
+        torch_dtype=torch.bfloat16 if device.startswith("cuda") else torch.float32,
+        device_map=None,
+    ).to(device)
+    model.eval()
+
+    for row in tqdm(pending, desc="Generating CoTs"):
+        prompt = row.get(prompt_field)
+        if not isinstance(prompt, str) or not prompt.strip():
+            raise ValueError(
+                f"Row idx={row['_cie_row_id']} has no non-empty {prompt_field!r} field"
             )
-            skipped += 1
-            continue
+        rendered = render_generation_prompt(tokenizer, prompt, raw_prompt)
+        inputs = tokenizer(rendered, return_tensors="pt")
+        inputs = {key: value.to(device) for key, value in inputs.items()}
 
-        sentences = candidate_sentences[:len(internal_graphs)]
+        # Intentionally leave temperature/top-p/top-k/do_sample at model defaults.
+        output_ids = model.generate(
+            **inputs,
+            max_new_tokens=max_new_tokens,
+            pad_token_id=tokenizer.eos_token_id,
+        )
+        new_ids = output_ids[0, inputs["input_ids"].shape[1] :]
+        completion = tokenizer.decode(new_ids, skip_special_tokens=True).strip()
+        steps, final_answer = split_reasoning_steps(completion)
 
-        records.append(
-            TraceRecord(
-                trace_id=trace_id,
+        saved = {key: value for key, value in row.items() if key != "_cie_row_id"}
+        saved["generation_prompt"] = rendered
+        saved["sample_0"] = {
+            "full_response": completion,
+            **{f"step_{i}": step for i, step in enumerate(steps, 1)},
+            "final_answer": final_answer,
+        }
+        response_path = responses_dir / f"response_{row['_cie_row_id']}.json"
+        response_path.write_text(
+            json.dumps(saved, ensure_ascii=False, indent=2), encoding="utf-8"
+        )
+
+    del model, tokenizer
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
+
+def load_response(path: Path) -> Tuple[Dict[str, Any], List[str]]:
+    response = json.loads(path.read_text(encoding="utf-8"))
+    sample = response["sample_0"]
+    step_keys = sorted(
+        (key for key in sample if re.fullmatch(r"step_\d+", key)),
+        key=lambda key: int(key.split("_")[1]),
+    )
+    return response, [sample[key].strip() for key in step_keys]
+
+
+def build_circuits(
+    rows: List[Dict[str, Any]],
+    responses_dir: Path,
+    circuits_dir: Path,
+    *,
+    model_name: str,
+    transcoder_name: str,
+    prompt_field: str,
+    overwrite: bool,
+) -> None:
+    missing: List[Tuple[Dict[str, Any], Path, List[str]]] = []
+    for row in rows:
+        row_id = row["_cie_row_id"]
+        response_path = responses_dir / f"response_{row_id}.json"
+        _, steps = load_response(response_path)
+        trace_dir = circuits_dir / f"response_{row_id}"
+        expected = []
+        for i in range(len(steps) + 1):
+            expected.extend(
+                [
+                    trace_dir / f"step_{i}.pt",
+                    trace_dir / "selection_meta" / f"step_{i}_selection.json",
+                ]
+            )
+        if overwrite or not all(path.exists() for path in expected):
+            missing.append((row, response_path, steps))
+    if not missing:
+        print("[circuits] All cached sentence circuits are present.")
+        return
+
+    print(f"[circuits] Loading replacement model for {len(missing)} traces.")
+    model = load_replacement_model(
+        model_name, transcoder_name, dtype=torch.bfloat16
+    )
+
+    for row, response_path, steps in tqdm(missing, desc="Tracing responses"):
+        row_id = row["_cie_row_id"]
+        trace_dir = circuits_dir / f"response_{row_id}"
+        meta_dir = trace_dir / "selection_meta"
+        trace_dir.mkdir(parents=True, exist_ok=True)
+        meta_dir.mkdir(parents=True, exist_ok=True)
+        items = [row[prompt_field]] + steps
+
+        for step_num, sentence in enumerate(items):
+            graph_path = trace_dir / f"step_{step_num}.pt"
+            meta_path = meta_dir / f"step_{step_num}_selection.json"
+            if graph_path.exists() and meta_path.exists() and not overwrite:
+                continue
+
+            selected, input_ids, entropies, causal_scores, final_scores = (
+                select_positions_entropy_causal(
+                    prompt=sentence,
+                    model=model,
+                    top_k=TOKEN_BUDGET,
+                    temperature=ENTROPY_TEMPERATURE,
+                    candidate_budget=CANDIDATE_BUDGET,
+                    sentence_lambda=SENTENCE_LAMBDA,
+                    beta=BETA,
+                    diversity_penalty=DIVERSITY_PENALTY,
+                    always_include_last=ALWAYS_INCLUDE_LAST,
+                    skip_first_token=True,
+                )
+            )
+            target_pos = max(selected)
+            graph = attribute_compressed(
+                prompt=sentence,
+                model=model,
+                max_n_logits=MAX_N_LOGITS,
+                desired_logit_prob=DESIRED_LOGIT_PROB,
+                batch_size=BATCH_SIZE,
+                max_feature_nodes=MAX_FEATURE_NODES,
+                max_features_per_position=MAX_FEATURES_PER_POSITION,
+                offload="cpu",
+                verbose=False,
+                update_interval=UPDATE_INTERVAL,
+                selected_positions=selected,
+                target_pos=target_pos,
+            )
+            graph.to_pt(graph_path)
+            metadata = {
+                "source_trace_file": response_path.name,
+                "step_num": step_num,
+                "step_text": sentence if step_num else "__base_prompt__",
+                "prompt": sentence,
+                "selected_positions": selected,
+                "selected_tokens": decode_selected_tokens(input_ids, selected, model),
+                "target_pos": target_pos,
+                "entropies": [float(value) for value in entropies.tolist()],
+                "causal_scores": {str(k): float(v) for k, v in causal_scores.items()},
+                "final_scores": {str(k): float(v) for k, v in final_scores.items()},
+            }
+            meta_path.write_text(
+                json.dumps(metadata, ensure_ascii=False, indent=2), encoding="utf-8"
+            )
+            del graph, input_ids, entropies
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+
+    del model
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
+
+def load_internal_graphs(
+    trace_dir: Path, number_of_steps: int
+) -> List[Any]:
+    graphs = []
+    for step_num in range(number_of_steps + 1):
+        graphs.append(
+            graph_to_data_compressed(
+                str(trace_dir / f"step_{step_num}.pt"),
+                str(trace_dir / "selection_meta" / f"step_{step_num}_selection.json"),
+                make_undirected=True,
+            )
+        )
+    return graphs
+
+
+def score_all(
+    rows: List[Dict[str, Any]],
+    responses_dir: Path,
+    circuits_dir: Path,
+    checkpoint_path: Path,
+    output_path: Path,
+    *,
+    device: str,
+    prompt_field: str,
+) -> None:
+    checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
+    if checkpoint.get("format_version") != 1:
+        raise ValueError(f"Unsupported checkpoint format in {checkpoint_path}")
+    config = checkpoint["model_config"]
+
+    print("[scoring] Loading the frozen external sentence encoder.")
+    encoder = FrozenSentenceEncoder(
+        model_name=checkpoint["bert_model_name"],
+        max_length=int(checkpoint.get("max_length", 256)),
+        device=device,
+    )
+    detector = JointFGWUnfaithfulnessDetector(**config).to(device)
+    detector.load_state_dict(checkpoint["state_dict"])
+    detector.eval()
+
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    temporary_path = output_path.with_suffix(output_path.suffix + ".tmp")
+    with temporary_path.open("w", encoding="utf-8") as stream:
+        for row in tqdm(rows, desc="Scoring traces"):
+            row_id = row["_cie_row_id"]
+            response_path = responses_dir / f"response_{row_id}.json"
+            response, steps = load_response(response_path)
+            sentences = [row[prompt_field]] + steps
+            internal_graphs = load_internal_graphs(
+                circuits_dir / f"response_{row_id}", len(steps)
+            )
+            record = TraceRecord(
+                trace_id=row_id,
                 sentences=sentences,
-                label=int(ext_meta["label"]),
+                label=0,
                 internal_graphs=internal_graphs,
             )
-        )
-
-    print(f"[INFO] aligned traces: {len(records)}, skipped: {skipped}")
-    return records
-
-
-def stratified_trace_split(
-    records: List[TraceRecord],
-    test_size: float = 0.2,
-    val_size: float = 0.1,
-    seed: int = 42,
-):
-    labels = [r.label for r in records]
-    idx = np.arange(len(records))
-
-    train_idx, test_idx = train_test_split(
-        idx, test_size=test_size, random_state=seed, stratify=labels
-    )
-    train_records = [records[i] for i in train_idx]
-    test_records = [records[i] for i in test_idx]
-
-    if val_size > 0 and len(train_records) > 1:
-        train_labels = [r.label for r in train_records]
-        idx2 = np.arange(len(train_records))
-        train2_idx, val_idx = train_test_split(
-            idx2, test_size=val_size, random_state=seed, stratify=train_labels
-        )
-        val_records = [train_records[i] for i in val_idx]
-        train_records = [train_records[i] for i in train2_idx]
-    else:
-        val_records = []
-
-    return train_records, val_records, test_records
-
-
-class FrozenSentenceEncoder:
-    """Frozen BERT sentence encoder for the external reasoning view.
-
-    Each reasoning sentence is encoded independently with a frozen BERT model and
-    mean-pooled over its tokens. This keeps the external representation a pure
-    text view, independent of the target LLM's internal hidden states.
-    """
-
-    def __init__(self, model_name: str = "bert-base-uncased", device: str = "cuda", max_length: int = 256):
-        self.device = device
-        self.max_length = max_length
-        self.tokenizer = AutoTokenizer.from_pretrained(model_name)
-        self.model = AutoModel.from_pretrained(model_name).to(device)
-        self.model.eval()
-
-    @torch.no_grad()
-    def encode_sentences(self, sentences: List[str], batch_size: int = 8) -> np.ndarray:
-        all_embs = []
-        for i in range(0, len(sentences), batch_size):
-            batch_sent = sentences[i:i+batch_size]
-            toks = self.tokenizer(
-                batch_sent,
-                return_tensors="pt",
-                truncation=True,
-                max_length=self.max_length,
-                padding=True,
-            )
-            toks = {k: v.to(self.device) for k, v in toks.items()}
-            out = self.model(**toks, return_dict=True)
-            hs = out.last_hidden_state
-            mask = toks["attention_mask"].unsqueeze(-1)
-            sent_emb = (hs * mask).sum(dim=1) / mask.sum(dim=1).clamp(min=1)
-            all_embs.append(sent_emb.float().cpu())
-        return torch.cat(all_embs, dim=0).numpy()
-
-
-def precompute_external_embeddings(records: List[TraceRecord], encoder: FrozenSentenceEncoder, batch_size: int = 8):
-    for r in records:
-        r.ext_embs = encoder.encode_sentences(r.sentences, batch_size=batch_size)
-
-
-class GINEncoder(nn.Module):
-    def __init__(self, in_dim: int, hidden_dim: int = 128, out_dim: int = 128, num_layers: int = 2):
-        super().__init__()
-        self.out_dim = out_dim
-        self.convs = nn.ModuleList()
-
-        def make_mlp(inp, outp):
-            return nn.Sequential(
-                nn.Linear(inp, hidden_dim),
-                nn.ReLU(),
-                nn.Linear(hidden_dim, outp),
-            )
-
-        if num_layers <= 1:
-            self.convs.append(GINConv(make_mlp(in_dim, out_dim)))
-        else:
-            self.convs.append(GINConv(make_mlp(in_dim, hidden_dim)))
-            for _ in range(num_layers - 2):
-                self.convs.append(GINConv(make_mlp(hidden_dim, hidden_dim)))
-            self.convs.append(GINConv(make_mlp(hidden_dim, out_dim)))
-
-    def forward(self, batch_data: Data) -> torch.Tensor:
-        x, edge_index, batch = batch_data.x, batch_data.edge_index, batch_data.batch
-        for i, conv in enumerate(self.convs):
-            x = conv(x, edge_index)
-            if i < len(self.convs) - 1:
-                x = F.relu(x)
-        return global_mean_pool(x, batch)
-
-
-def build_trace_graph_from_embeddings(
-    x: torch.Tensor,
-    seq_weight: float = 1.0,
-    sim_weight: float = 0.5,
-    forward_only: bool = True,
-):
-    T = x.size(0)
-    device = x.device
-
-    x_norm = F.normalize(x, dim=-1)
-    sim = torch.matmul(x_norm, x_norm.T)
-
-    if forward_only:
-        mask = torch.triu(torch.ones(T, T, device=device), diagonal=1)
-        sim = F.relu(sim) * mask
-    else:
-        sim = F.relu(sim)
-        sim.fill_diagonal_(0.0)
-
-    A = sim_weight * sim
-
-    if T > 1:
-        seq_edges = torch.zeros(T, T, device=device)
-        idx = torch.arange(T - 1, device=device)
-        seq_edges[idx, idx + 1] = 1.0
-        A = A + seq_weight * seq_edges
-
-    row_sum = A.sum(dim=1, keepdim=True).clamp(min=1e-8)
-    A = A / row_sum
-    mu = torch.full((T,), 1.0 / T, device=device)
-    return {"A": A, "X": x, "mu": mu}
-
-
-class MLPProjector(nn.Module):
-    def __init__(self, in_dim: int, out_dim: int, hidden_dim: int = 128, dropout: float = 0.2):
-        super().__init__()
-        self.net = nn.Sequential(
-            nn.Linear(in_dim, hidden_dim),
-            nn.ReLU(),
-            nn.Dropout(dropout),
-            nn.Linear(hidden_dim, out_dim),
-        )
-
-    def forward(self, x):
-        return self.net(x)
-
-
-class JointFGWUnfaithfulnessDetector(nn.Module):
-    def __init__(
-        self,
-        ext_in_dim: int,
-        int_in_dim: int,
-        hidden_dim: int = 128,
-        proj_dim: int = 128,
-        gin_layers: int = 2,
-        alpha: float = 0.5,
-        seq_weight: float = 1.0,
-        sim_weight: float = 0.5,
-    ):
-        super().__init__()
-        self.gin = GINEncoder(
-            in_dim=int_in_dim,
-            hidden_dim=hidden_dim,
-            out_dim=proj_dim,
-            num_layers=gin_layers,
-        )
-        self.ext_proj = MLPProjector(ext_in_dim, proj_dim, hidden_dim=hidden_dim, dropout=0.2)
-        self.int_proj = MLPProjector(proj_dim, proj_dim, hidden_dim=hidden_dim, dropout=0.2)
-
-        self.alpha = alpha
-        self.seq_weight = seq_weight
-        self.sim_weight = sim_weight
-
-    def encode_internal_trace(self, graphs: List[Data], device: str):
-        loader = PyGDataLoader(graphs, batch_size=min(len(graphs), 64), shuffle=False)
-        outs = []
-        for batch in loader:
-            batch = batch.to(device)
-            emb = self.gin(batch)
-            outs.append(emb)
-        return torch.cat(outs, dim=0)
-
-    def compute_fgw_distance(self, ext_graph: Dict[str, torch.Tensor], int_graph: Dict[str, torch.Tensor]):
-        A_ext, X_ext, mu_ext = ext_graph["A"], ext_graph["X"], ext_graph["mu"]
-        A_int, X_int, mu_int = int_graph["A"], int_graph["X"], int_graph["mu"]
-
-        M = torch.cdist(X_ext, X_int, p=2) ** 2
-
-        dist = ot.gromov.fused_gromov_wasserstein2(
-            M=M,
-            C1=A_ext,
-            C2=A_int,
-            p=mu_ext,
-            q=mu_int,
-            loss_fun="square_loss",
-            alpha=self.alpha,
-        )
-
-        if not isinstance(dist, torch.Tensor):
-            dist = torch.tensor(dist, dtype=X_ext.dtype, device=X_ext.device)
-
-        return dist
-
-    def forward(self, record: TraceRecord, device: str):
-        ext_embs = torch.tensor(record.ext_embs, dtype=torch.float32, device=device)
-        ext_x = self.ext_proj(ext_embs)
-        ext_x = F.normalize(ext_x, dim=-1)
-        ext_graph = build_trace_graph_from_embeddings(
-            ext_x,
-            seq_weight=self.seq_weight,
-            sim_weight=self.sim_weight,
-            forward_only=True,
-        )
-
-        int_embs = self.encode_internal_trace(record.internal_graphs, device=device)
-        int_x = self.int_proj(int_embs)
-        int_x = F.normalize(int_x, dim=-1)
-        int_graph = build_trace_graph_from_embeddings(
-            int_x,
-            seq_weight=self.seq_weight,
-            sim_weight=self.sim_weight,
-            forward_only=True,
-        )
-      
-        raw_dist = self.compute_fgw_distance(ext_graph, int_graph)
-        score = torch.log1p(raw_dist.clamp(min=0.0))
-        #score = torch.sigmoid(torch.log1p(raw_dist))
-        return score, raw_dist
-
-
-def compute_class_weights(records: List[TraceRecord]) -> Tuple[float, float]:
-    labels = np.array([r.label for r in records], dtype=np.float32)
-    pos = float(labels.sum())
-    neg = float(len(labels) - pos)
-    if pos == 0 or neg == 0:
-        return 1.0, 1.0
-    w_pos = neg / (pos + 1e-8)
-    w_neg = 1.0
-    return w_neg, w_pos
-
-
-def margin_distance_loss(score: torch.Tensor, y: torch.Tensor, margin: float, w_neg: float = 1.0, w_pos: float = 1.0):
-    margin_t = torch.tensor(margin, device=score.device, dtype=score.dtype)
-    loss_faithful = (1.0 - y) * score
-    loss_unfaithful = y * torch.relu(margin_t - score)
-    return w_neg * loss_faithful + w_pos * loss_unfaithful
-
-
-def select_best_threshold(scores: List[float], labels: List[int]) -> float:
-    if len(scores) == 0:
-        return 0.5
-    uniq = sorted(set(scores))
-    if len(uniq) == 1:
-        return float(uniq[0])
-
-    candidates = [uniq[0] - 1e-6]
-    for i in range(len(uniq) - 1):
-        candidates.append((uniq[i] + uniq[i + 1]) / 2.0)
-    candidates.append(uniq[-1] + 1e-6)
-
-    best_thr = candidates[0]
-    best_f1 = -1.0
-    best_acc = -1.0
-
-    for thr in candidates:
-        preds = [1 if s > thr else 0 for s in scores]
-        f1 = f1_score(labels, preds, zero_division=0)
-        acc = accuracy_score(labels, preds)
-        if (f1 > best_f1) or (f1 == best_f1 and acc > best_acc):
-            best_f1 = f1
-            best_acc = acc
-            best_thr = thr
-
-    return float(best_thr)
-
-
-def evaluate(model, records: List[TraceRecord], device: str, threshold: Optional[float] = None):
-    model.eval()
-    ys, scores, raw_dists = [], [], []
-
-    with torch.no_grad():
-        for r in records:
-            score, raw_dist = model(r, device=device)
-            ys.append(r.label)
-            scores.append(float(score.item()))
-            raw_dists.append(float(raw_dist.item()))
-
-    if threshold is None:
-        threshold = select_best_threshold(scores, ys)
-
-    preds = [1 if s > threshold else 0 for s in scores]
-    acc = accuracy_score(ys, preds) if len(ys) > 0 else 0.0
-    f1 = f1_score(ys, preds, zero_division=0) if len(ys) > 0 else 0.0
-
-    return {
-        "acc": acc,
-        "f1": f1,
-        "threshold": threshold,
-        "mean_score": float(np.mean(scores)) if len(scores) > 0 else 0.0,
-        "mean_raw_dist": float(np.mean(raw_dists)) if len(raw_dists) > 0 else 0.0,
-    }
-
-
-def train(
-    model: JointFGWUnfaithfulnessDetector,
-    train_records: List[TraceRecord],
-    val_records: List[TraceRecord],
-    test_records: List[TraceRecord],
-    device: str,
-    epochs: int = 20,
-    lr: float = 1e-4,
-    weight_decay: float = 1e-4,
-    margin: float = 2.0,
-):
-    w_neg, w_pos = compute_class_weights(train_records)
-    optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
-
-    best_state = None
-    best_val_f1 = -1.0
-    best_threshold = 0.5
-
-    for epoch in range(1, epochs + 1):
-        model.train()
-        random.shuffle(train_records)
-        total_loss = 0.0
-
-        for r in train_records:
-            y = torch.tensor(float(r.label), dtype=torch.float32, device=device)
-            score, _ = model(r, device=device)
-            loss = margin_distance_loss(score, y, margin=margin, w_neg=w_neg, w_pos=w_pos)
-
-            optimizer.zero_grad()
-            loss.backward()
-            optimizer.step()
-
-            total_loss += float(loss.item())
-
-        avg_loss = total_loss / max(len(train_records), 1)
-
-        if len(val_records) > 0:
-            val_probe = evaluate(model, val_records, device=device, threshold=None)
-            current_threshold = val_probe["threshold"]
-        else:
-            train_probe = evaluate(model, train_records, device=device, threshold=None)
-            current_threshold = train_probe["threshold"]
-
-        train_metrics = evaluate(model, train_records, device=device, threshold=current_threshold)
-        val_metrics = evaluate(model, val_records, device=device, threshold=current_threshold) if len(val_records) > 0 else {"acc": 0.0, "f1": 0.0}
-        test_metrics = evaluate(model, test_records, device=device, threshold=current_threshold)
-
-        print(
-            f"[Epoch {epoch:03d}] "
-            f"loss={avg_loss:.4f} | "
-            f"thr={current_threshold:.4f} | "
-            f"train_acc={train_metrics['acc']:.4f}, train_f1={train_metrics['f1']:.4f} | "
-            f"val_acc={val_metrics['acc']:.4f}, val_f1={val_metrics['f1']:.4f} | "
-            f"test_acc={test_metrics['acc']:.4f}, test_f1={test_metrics['f1']:.4f}"
-        )
-
-        monitor_f1 = val_metrics["f1"] if len(val_records) > 0 else test_metrics["f1"]
-        if monitor_f1 > best_val_f1:
-            best_val_f1 = monitor_f1
-            best_threshold = current_threshold
-            best_state = {k: v.detach().cpu() for k, v in model.state_dict().items()}
-
-    if best_state is not None:
-        model.load_state_dict(best_state)
-
-    return model, best_threshold
-
-
-def save_detector_checkpoint(
-    path: str,
-    model: JointFGWUnfaithfulnessDetector,
-    threshold: float,
-    *,
-    bert_model_name: str,
-    max_length: int,
-    ext_in_dim: int,
-    int_in_dim: int,
-    hidden_dim: int,
-    proj_dim: int,
-    gin_layers: int,
-    alpha: float,
-    seq_weight: float,
-    sim_weight: float,
-):
-    """Save everything required to reproduce an inference-time score."""
-    output_path = Path(path)
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    payload = {
-        "format_version": 1,
-        "state_dict": {k: v.detach().cpu() for k, v in model.state_dict().items()},
-        "threshold": float(threshold),
-        "bert_model_name": bert_model_name,
-        "max_length": int(max_length),
-        "model_config": {
-            "ext_in_dim": int(ext_in_dim),
-            "int_in_dim": int(int_in_dim),
-            "hidden_dim": int(hidden_dim),
-            "proj_dim": int(proj_dim),
-            "gin_layers": int(gin_layers),
-            "alpha": float(alpha),
-            "seq_weight": float(seq_weight),
-            "sim_weight": float(sim_weight),
-        },
-    }
-    torch.save(payload, output_path)
-    print(f"Saved detector checkpoint to {output_path}")
-
-
-def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument(
-        "--json_source",
-        type=str,
-        required=True,
-        help="Either a directory of response_i.json files or a single JSON file"
-    )
-    parser.add_argument(
-        "--internal_pyg_dir",
-        type=str,
-        required=True,
-        help="Directory containing index.json and processed/*.pt"
-    )
-    parser.add_argument("--bert_model_name", type=str, default="bert-base-uncased")
-    parser.add_argument("--max_length", type=int, default=256)
-    parser.add_argument("--test_size", type=float, default=0.4)
-    parser.add_argument("--val_size", type=float, default=0.3)
-    parser.add_argument("--epochs", type=int, default=20)
-    parser.add_argument("--lr", type=float, default=1e-4)
-    parser.add_argument("--weight_decay", type=float, default=1e-4)
-    parser.add_argument("--margin", type=float, default=2.0)
-    parser.add_argument("--hidden_dim", type=int, default=128)
-    parser.add_argument("--proj_dim", type=int, default=128)
-    parser.add_argument("--gin_layers", type=int, default=2)
-    parser.add_argument("--alpha", type=float, default=0.5)
-    parser.add_argument("--seq_weight", type=float, default=1.0)
-    parser.add_argument("--sim_weight", type=float, default=0.4)
-    parser.add_argument("--ext_batch_size", type=int, default=8)
-    parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument("--device", type=str, default="cuda")
-    parser.add_argument(
-        "--checkpoint_out",
-        type=str,
-        default=None,
-        help="Optional path for a reusable inference checkpoint",
-    )
-    args = parser.parse_args()
-
-    set_seed(args.seed)
-
-    print("[1/6] Building aligned trace records...")
-    records = build_aligned_records(
-        json_source=args.json_source,
-        internal_pyg_dir=args.internal_pyg_dir,
-    )
-    if len(records) == 0:
-        raise RuntimeError("No aligned records found. Please check json/index alignment.")
-
-    print("[2/6] Trace-level stratified split...")
-    train_records, val_records, test_records = stratified_trace_split(
-        records,
-        test_size=args.test_size,
-        val_size=args.val_size,
-        seed=args.seed,
-    )
-    print(f"Train={len(train_records)}, Val={len(val_records)}, Test={len(test_records)}")
-
-    print("[3/6] Building frozen external sentence encoder and precomputing sentence embeddings...")
-    sentence_encoder = FrozenSentenceEncoder(
-        model_name=args.bert_model_name,
-        max_length=args.max_length,
+            record.ext_embs = encoder.encode_sentences(sentences, batch_size=8)
+            with torch.no_grad():
+                score, raw_distance = detector(record, device=device)
+
+            result = {key: value for key, value in row.items() if key != "_cie_row_id"}
+            result["response"] = response["sample_0"]["full_response"]
+            result["unfaithful_score"] = float(score.item())
+            result["raw_fgw_distance"] = float(raw_distance.item())
+            result["unfaithful_threshold"] = float(checkpoint["threshold"])
+            stream.write(json.dumps(result, ensure_ascii=False) + "\n")
+            stream.flush()
+
+    temporary_path.replace(output_path)
+    print(f"[done] Wrote {len(rows)} scored records to {output_path}")
+
+
+def main() -> None:
+    args = parse_args()
+    input_path = Path(args.input_jsonl).resolve()
+    output_path = Path(args.output_jsonl).resolve()
+    checkpoint_path = Path(args.checkpoint).resolve()
+    work_dir = Path(args.work_dir).resolve()
+    if not input_path.is_file():
+        raise FileNotFoundError(input_path)
+    if not checkpoint_path.is_file():
+        raise FileNotFoundError(checkpoint_path)
+
+    responses_dir = work_dir / "responses"
+    circuits_dir = work_dir / "circuits"
+    responses_dir.mkdir(parents=True, exist_ok=True)
+    circuits_dir.mkdir(parents=True, exist_ok=True)
+    rows = read_jsonl(input_path)
+    print(f"Loaded {len(rows)} input records from {input_path}")
+
+    generate_responses(
+        rows,
+        responses_dir,
+        model_name=args.model_name,
+        prompt_field=args.prompt_field,
+        max_new_tokens=args.max_new_tokens,
         device=args.device,
+        raw_prompt=args.raw_prompt,
+        overwrite=args.overwrite,
     )
-    precompute_external_embeddings(train_records, sentence_encoder, batch_size=args.ext_batch_size)
-    precompute_external_embeddings(val_records, sentence_encoder, batch_size=args.ext_batch_size)
-    precompute_external_embeddings(test_records, sentence_encoder, batch_size=args.ext_batch_size)
-
-    print("[4/6] Inferring feature dimensions...")
-    one_graph = train_records[0].internal_graphs[0]
-    int_in_dim = one_graph.x.shape[1]
-    ext_in_dim = train_records[0].ext_embs.shape[1]
-    print(f"External input dim = {ext_in_dim}, Internal node dim = {int_in_dim}")
-
-    print("[5/6] Building joint FGW detector...")
-    model = JointFGWUnfaithfulnessDetector(
-        ext_in_dim=ext_in_dim,
-        int_in_dim=int_in_dim,
-        hidden_dim=args.hidden_dim,
-        proj_dim=args.proj_dim,
-        gin_layers=args.gin_layers,
-        alpha=args.alpha,
-        seq_weight=args.seq_weight,
-        sim_weight=args.sim_weight,
-    ).to(args.device)
-
-    print("[6/6] Training...")
-    model, best_threshold = train(
-        model=model,
-        train_records=train_records,
-        val_records=val_records,
-        test_records=test_records,
+    build_circuits(
+        rows,
+        responses_dir,
+        circuits_dir,
+        model_name=args.model_name,
+        transcoder_name=args.transcoder_name,
+        prompt_field=args.prompt_field,
+        overwrite=args.overwrite,
+    )
+    score_all(
+        rows,
+        responses_dir,
+        circuits_dir,
+        checkpoint_path,
+        output_path,
         device=args.device,
-        epochs=args.epochs,
-        lr=args.lr,
-        weight_decay=args.weight_decay,
-        margin=args.margin,
+        prompt_field=args.prompt_field,
     )
-
-    print("\n===== Final Evaluation =====")
-    train_metrics = evaluate(model, train_records, device=args.device, threshold=best_threshold)
-    val_metrics = evaluate(model, val_records, device=args.device, threshold=best_threshold) if len(val_records) > 0 else {"acc": 0.0, "f1": 0.0}
-    test_metrics = evaluate(model, train_records+val_records+test_records, device=args.device, threshold=best_threshold)
-
-    print(f"Best threshold = {best_threshold:.4f}")
-    print(f"Train ACC={train_metrics['acc']:.4f}, F1={train_metrics['f1']:.4f}")
-    print(f"Val   ACC={val_metrics['acc']:.4f}, F1={val_metrics['f1']:.4f}")
-    print(f"Test  ACC={test_metrics['acc']:.4f}, F1={test_metrics['f1']:.4f}")
-    print(f"Test mean score = {test_metrics['mean_score']:.4f}")
-    print(f"Test mean raw FGW distance = {test_metrics['mean_raw_dist']:.4f}")
-
-    if args.checkpoint_out:
-        save_detector_checkpoint(
-            args.checkpoint_out,
-            model,
-            best_threshold,
-            bert_model_name=args.bert_model_name,
-            max_length=args.max_length,
-            ext_in_dim=ext_in_dim,
-            int_in_dim=int_in_dim,
-            hidden_dim=args.hidden_dim,
-            proj_dim=args.proj_dim,
-            gin_layers=args.gin_layers,
-            alpha=args.alpha,
-            seq_weight=args.seq_weight,
-            sim_weight=args.sim_weight,
-        )
 
 
 if __name__ == "__main__":
