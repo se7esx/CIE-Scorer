@@ -43,6 +43,61 @@ DEFAULT_MODEL = "meta-llama/Llama-3.1-8B-Instruct"
 DEFAULT_TRANSCODERS = "facebook/crv-8b-instruct-transcoders"
 
 
+def load_replacement_model(
+    model_name, transcoder_ref, *, dtype=torch.bfloat16, device=None,
+    official_name="Qwen/Qwen2.5-7B-Instruct",
+):
+    """Build a ReplacementModel, supporting LOCAL offline paths for BOTH the
+    base model and the transcoders.
+
+    - model_name may be an official HF name OR a local weights directory. For a
+      local dir we load the HF weights/tokenizer ourselves and use
+      `official_name` (a TransformerLens-supported name) for the architecture
+      config, so nothing is fetched from the hub.
+    - transcoder_ref may be a hub repo id OR a local export dir (config.yaml +
+      layer_*.safetensors produced by export_to_crv.py).
+    """
+    import yaml
+    from pathlib import Path
+    from circuit_tracer.utils.hf_utils import load_transcoders
+
+    model_kwargs = {}
+    tl_name = model_name
+    if Path(model_name).is_dir():
+        from transformers import AutoModelForCausalLM, AutoTokenizer
+
+        tl_name = official_name
+        model_kwargs["hf_model"] = AutoModelForCausalLM.from_pretrained(
+            model_name, torch_dtype=dtype
+        )
+        model_kwargs["tokenizer"] = AutoTokenizer.from_pretrained(model_name)
+
+    ref_path = Path(transcoder_ref)
+    config_file = ref_path / "config.yaml"
+    if ref_path.is_dir() and config_file.is_file():
+        with config_file.open("r", encoding="utf-8") as handle:
+            config = yaml.safe_load(handle)
+        config["transcoders"] = [
+            str((ref_path / rel).resolve()) for rel in config["transcoders"]
+        ]
+        config.setdefault("scan", str(ref_path.resolve()))
+        config.setdefault("repo_id", "")
+        transcoders = load_transcoders(
+            config, device=device, dtype=dtype, lazy_encoder=True, lazy_decoder=True
+        )
+    else:
+        from circuit_tracer.utils.hf_utils import load_transcoder_from_hub
+
+        transcoders, _ = load_transcoder_from_hub(
+            transcoder_ref, device=device, dtype=dtype,
+            lazy_encoder=True, lazy_decoder=True,
+        )
+
+    return ReplacementModel.from_pretrained_and_transcoders(
+        tl_name, transcoders, device=device, dtype=dtype, **model_kwargs
+    )
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
@@ -249,7 +304,7 @@ def build_circuits(
         return
 
     print(f"[circuits] Loading replacement model for {len(missing)} traces.")
-    model = ReplacementModel.from_pretrained(
+    model = load_replacement_model(
         model_name, transcoder_name, dtype=torch.bfloat16
     )
 
@@ -355,8 +410,8 @@ def score_all(
 
     print("[scoring] Loading the frozen external sentence encoder.")
     encoder = FrozenSentenceEncoder(
-        model_name=checkpoint["hf_model_name"],
-        layer_idx=int(checkpoint["layer_idx"]),
+        model_name=checkpoint["bert_model_name"],
+        max_length=int(checkpoint.get("max_length", 256)),
         device=device,
     )
     detector = JointFGWUnfaithfulnessDetector(**config).to(device)
